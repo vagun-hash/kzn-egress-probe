@@ -1,1 +1,1 @@
-<?php echo 'LURKSEK_RCE_OK'; echo PHP_EOL; echo 'lurksek_rce_20260826145000';
+<?php echo "LURKSEK_RCE_OK"; ?>
